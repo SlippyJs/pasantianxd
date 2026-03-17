@@ -8,16 +8,13 @@ Diseño:
 - No ejecuta extracción en paralelo (evita saturar CPU)
 - Código claro, limpio y fácil de modificar
 
-Mejoras respecto a la versión anterior:
+Mejoras:
 ① Si se detecta frase gatillo pero NINGÚN token de categoría coincide
   → se clasifica como MEDICAMENTOS por defecto y se extrae igual
-  (evita perder carpetas válidas con redacción poco frecuente)
-② Tokens ampliados para mayor cobertura en cada categoría
+② Pase 2: si no hay gatillo, busca tokens directamente para evitar
+  SIN_DETECCION cuando "medicamentos" aparece sin frase de gatillo
 ③ El detalle incluye el PDF exacto y la página donde se detectó la frase
-
-Salida:
-- Excel con hojas "Resumen" y "Detalle" (incluye columnas pdf_origen y pagina_origen)
-- Excels de extracción dentro de cada carpeta apta
+④ El resumen global no incluye la columna Debe_Extraerse
 """
 
 from __future__ import annotations
@@ -54,7 +51,6 @@ CATEGORIA_INSUMOS      = "INSUMOS"
 CATEGORIA_SIN          = "SIN_DETECCION"
 
 # Categoría por defecto cuando se detecta un gatillo pero ningún token coincide.
-# Cambie esto si prefiere otro comportamiento (ej: CATEGORIA_SIN para no extraer).
 CATEGORIA_FALLBACK = CATEGORIA_MEDICAMENTOS
 
 
@@ -62,11 +58,8 @@ CATEGORIA_FALLBACK = CATEGORIA_MEDICAMENTOS
 # Tokens de categoría
 #
 # PRIORIDAD DE EVALUACIÓN: Medicamentos → Dispositivos → Insumos
-# Si una línea contiene tokens de varias categorías, gana la primera evaluada.
-# Cambie el orden de evaluación en _categoria_de_linea() si necesita otra prioridad.
-#
 # Agregue o quite términos según la realidad de sus documentos.
-# Todos los tokens se comparan SIN acentos y en minúsculas (se normalizan).
+# Todos los tokens se comparan SIN acentos y en minúsculas.
 # =============================================================================
 
 TOKENS_MEDICAMENTOS: Tuple[str, ...] = (
@@ -108,7 +101,6 @@ TOKENS_INSUMOS: Tuple[str, ...] = (
 )
 
 # Frases que "activan" el análisis de categoría en esa línea.
-# Si una línea contiene cualquiera de estas frases → se evalúa qué tipo es.
 GATILLOS: Tuple[str, ...] = (
     "adquisicion de",
     "contratacion de",
@@ -127,8 +119,8 @@ COLUMNAS_DETALLE = (
     "clasificacion",
     "frase_detectada",
     "motivo",
-    "pdf_origen",     # PDF donde se encontró la frase
-    "pagina_origen",  # Número de página (base 1)
+    "pdf_origen",
+    "pagina_origen",
     "ruta",
     "debe_extraerse",
 )
@@ -157,7 +149,7 @@ def extraer_lineas(pagina) -> List[str]:
     Extrae líneas de texto de una página pdfplumber.
     Si extract_text() no devuelve nada, intenta extract_words() como fallback.
     """
-    txt = pagina.extract_text() or ""
+    txt    = pagina.extract_text() or ""
     lineas = [l for l in txt.splitlines() if l.strip()]
     if lineas:
         return lineas
@@ -165,7 +157,7 @@ def extraer_lineas(pagina) -> List[str]:
     # Fallback: reconstruir línea a partir de palabras sueltas
     try:
         palabras = pagina.extract_words() or []
-        linea = " ".join(w.get("text", "") for w in palabras if w.get("text"))
+        linea    = " ".join(w.get("text", "") for w in palabras if w.get("text"))
         if linea.strip():
             return [linea]
     except Exception:
@@ -183,17 +175,12 @@ class ClasificadorCarpetas:
     Clasifica carpetas analizando frases en sus PDFs.
 
     Lógica de clasificación:
-    1. Lee cada PDF página por página (hasta `paginas_a_leer` páginas).
-    2. Por cada línea, verifica si contiene alguna frase GATILLO.
-    3. Si hay gatillo, determina la CATEGORÍA por los tokens de la línea:
-       MEDICAMENTOS → DISPOSITIVOS → INSUMOS (en ese orden de prioridad).
-    4. Si hay gatillo pero ningún token coincide → usa CATEGORIA_FALLBACK
-       (por defecto MEDICAMENTOS) para no perder carpetas válidas.
-    5. Si no hay ningún gatillo en ningún PDF → SIN_DETECCION.
+    Pase 1 — busca líneas con gatillo + token de categoría.
+    Pase 2 — si el pase 1 no encontró nada, busca tokens directamente
+             sin requerir gatillo. Evita SIN_DETECCION cuando aparece
+             "medicamentos" o similar sin frase de gatillo delante.
 
-    Parámetros configurables en __init__:
-    - paginas_a_leer: cuántas páginas revisar por PDF (default 3)
-    - Puede sobreescribir tokens o gatillos pasando tuplas propias
+    Solo llega a SIN_DETECCION si no hay ni gatillo ni token en ningún PDF.
     """
 
     def __init__(
@@ -213,7 +200,7 @@ class ClasificadorCarpetas:
         self.categoria_fallback = categoria_fallback
 
     # ------------------------------------------------------------------
-    # Métodos internos (prefijo _ = uso interno, no llamar desde afuera)
+    # Métodos internos
     # ------------------------------------------------------------------
 
     def _linea_tiene_gatillo(self, linea_normalizada: str) -> bool:
@@ -224,7 +211,8 @@ class ClasificadorCarpetas:
         """
         Determina la categoría según los tokens presentes en la línea.
         Devuelve (categoria, token_encontrado) o (None, None) si no hay match.
-        El orden de evaluación define la prioridad entre categorías.
+        El orden de evaluación define la prioridad entre categorías:
+        MEDICAMENTOS → DISPOSITIVOS → INSUMOS
         """
         grupos = [
             (self.tokens_meds, CATEGORIA_MEDICAMENTOS),
@@ -237,6 +225,22 @@ class ClasificadorCarpetas:
                     return categoria, tok
 
         return None, None
+
+    def _leer_lineas_pdf(self, pdf_path: Path) -> List[Tuple[int, str]]:
+        """
+        Lee las primeras `paginas_a_leer` páginas de un PDF.
+        Devuelve lista de (num_pagina_base1, linea).
+        """
+        lineas: List[Tuple[int, str]] = []
+        try:
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                paginas_a_revisar = min(self.paginas_a_leer, len(pdf.pages))
+                for num_pagina in range(paginas_a_revisar):
+                    for linea in extraer_lineas(pdf.pages[num_pagina]):
+                        lineas.append((num_pagina + 1, linea))
+        except Exception as e:
+            logging.error(f"[ERROR] No se pudo leer '{pdf_path.name}': {e}")
+        return lineas
 
     # ------------------------------------------------------------------
     # Método público principal
@@ -253,58 +257,75 @@ class ClasificadorCarpetas:
         - debe_extraerse: True si la carpeta debe procesarse
         """
         ruta_carpeta = Path(ruta_carpeta)
-        nombre = ruta_carpeta.name
+        nombre       = ruta_carpeta.name
 
         pdfs = sorted(
             (p for p in ruta_carpeta.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"),
             key=lambda p: p.name,
         )
 
+        # ------------------------------------------------------------------
+        # Pase 1: gatillo + token (resultado más preciso)
+        # ------------------------------------------------------------------
         for pdf_path in pdfs:
-            try:
-                with pdfplumber.open(str(pdf_path)) as pdf:
-                    paginas_a_revisar = min(self.paginas_a_leer, len(pdf.pages))
+            for num_pagina, linea in self._leer_lineas_pdf(pdf_path):
+                linea_norm = normalizar(linea)
 
-                    for num_pagina in range(paginas_a_revisar):
-                        pagina = pdf.pages[num_pagina]
+                if not self._linea_tiene_gatillo(linea_norm):
+                    continue
 
-                        for linea in extraer_lineas(pagina):
-                            linea_norm = normalizar(linea)
+                # Gatillo encontrado → buscar categoría
+                categoria, token = self._categoria_de_linea(linea_norm)
 
-                            if not self._linea_tiene_gatillo(linea_norm):
-                                continue
+                if categoria is None:
+                    # Gatillo sin token → usar fallback para no perder la carpeta
+                    categoria = self.categoria_fallback
+                    token     = "[fallback desde gatillo sin token]"
 
-                            # Hay gatillo → buscar categoría
-                            categoria, token = self._categoria_de_linea(linea_norm)
+                return {
+                    "carpeta":         nombre,
+                    "ruta":            str(ruta_carpeta),
+                    "clasificacion":   categoria,
+                    "frase_detectada": linea.strip(),
+                    "motivo":          token or "",
+                    "pdf_origen":      pdf_path.name,
+                    "pagina_origen":   num_pagina,
+                    "debe_extraerse":  True,
+                }
 
-                            if categoria is None:
-                                # ① MEJORA: gatillo sin token → usar fallback en lugar de ignorar
-                                categoria = self.categoria_fallback
-                                token = f"[fallback desde gatillo sin token]"
+        # ------------------------------------------------------------------
+        # Pase 2: sin gatillo, buscar tokens directamente.
+        # Evita SIN_DETECCION cuando "medicamentos" aparece sin la frase
+        # exacta de un gatillo ("adquisición de", "compra de", etc.).
+        # ------------------------------------------------------------------
+        for pdf_path in pdfs:
+            for num_pagina, linea in self._leer_lineas_pdf(pdf_path):
+                linea_norm = normalizar(linea)
+                categoria, token = self._categoria_de_linea(linea_norm)
 
-                            return {
-                                "carpeta":        nombre,
-                                "ruta":           str(ruta_carpeta),
-                                "clasificacion":  categoria,
-                                "frase_detectada": linea.strip(),
-                                "motivo":         token or "",
-                                "pdf_origen":     pdf_path.name,        # ③ NUEVO
-                                "pagina_origen":  num_pagina + 1,        # ③ NUEVO (base 1)
-                                "debe_extraerse": True,
-                            }
+                if categoria is None:
+                    continue  # línea sin tokens de interés
 
-            except Exception as e:
-                logging.error(f"[ERROR] No se pudo leer '{pdf_path.name}' en '{nombre}': {e}")
+                return {
+                    "carpeta":         nombre,
+                    "ruta":            str(ruta_carpeta),
+                    "clasificacion":   categoria,
+                    "frase_detectada": linea.strip(),
+                    "motivo":          f"[token directo] {token}",
+                    "pdf_origen":      pdf_path.name,
+                    "pagina_origen":   num_pagina,
+                    "debe_extraerse":  True,
+                }
 
-        # Ningún gatillo encontrado en ningún PDF
+        # Ningún gatillo ni token encontrado en ningún PDF
         return {
             "carpeta":         nombre,
             "ruta":            str(ruta_carpeta),
             "clasificacion":   CATEGORIA_SIN,
             "frase_detectada": "",
             "motivo":          "",
-            "pdf_origen":      "",   # ③
-            "pagina_origen":   "",   # ③
+            "pdf_origen":      "",
+            "pagina_origen":   "",
             "debe_extraerse":  False,
         }
 
@@ -314,15 +335,18 @@ class ClasificadorCarpetas:
 # =============================================================================
 
 def _dataframe_resumen(detalles: Iterable[Detalle]) -> pd.DataFrame:
-    """Hoja Resumen: vista resumida con columnas clave para revisión rápida."""
+    """
+    Hoja Resumen: vista resumida para revisión rápida.
+    Columnas: Carpeta, Clasificación, Frase_Detectada, PDF_Origen, Página_Origen.
+    La columna Debe_Extraerse se omite intencionalmente del resumen.
+    """
     filas = [
         {
             "Carpeta":         d.get("carpeta", ""),
             "Clasificación":   d.get("clasificacion", ""),
             "Frase_Detectada": d.get("frase_detectada", ""),
-            "PDF_Origen":      d.get("pdf_origen", ""),      # ③ NUEVO
-            "Página_Origen":   d.get("pagina_origen", ""),   # ③ NUEVO
-            "Debe_Extraerse":  d.get("debe_extraerse", False),
+            "PDF_Origen":      d.get("pdf_origen", ""),
+            "Página_Origen":   d.get("pagina_origen", ""),
         }
         for d in detalles
     ]
@@ -345,8 +369,8 @@ def _dataframe_detalle(detalles: Iterable[Detalle]) -> pd.DataFrame:
 def generar_resumen_excel_desde_detalles(detalles: List[Detalle], ruta_excel: Path | str) -> None:
     """
     Exporta el Excel global con dos hojas:
-    - Resumen: vista rápida para revisión
-    - Detalle: todas las columnas incluyendo pdf_origen y pagina_origen
+    - Resumen: Carpeta, Clasificación, Frase_Detectada, PDF_Origen, Página_Origen
+    - Detalle: todas las columnas incluyendo ruta y debe_extraerse
     """
     ruta_excel = Path(ruta_excel)
     ruta_excel.parent.mkdir(parents=True, exist_ok=True)
