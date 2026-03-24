@@ -1,0 +1,297 @@
+def _leer_excel_moleculas(self, ruta_archivo: Path) -> List[Dict[str, str]]:
+Define la función. Recibe ruta_archivo que es la ruta del CSV, y retorna una lista de diccionarios donde cada clave y valor son strings.
+
+python    df = pd.read_csv(ruta_archivo, sep="|", dtype=str)
+
+pd.read_csv lee el archivo CSV y lo convierte en un DataFrame (una tabla).
+sep="|" le dice que las columnas están separadas por | en lugar de la coma habitual.
+dtype=str fuerza que todo se lea como texto. Sin esto, pandas podría interpretar números como float y los valores vacíos los convertiría en NaN (que es un float), lo que causaría errores más adelante.
+
+
+python    df["DESC_MOLECULA_ASOC"] = df["DESC_MOLECULA_ASOC"].str.strip().str.lower()
+
+df["DESC_MOLECULA_ASOC"] accede a la columna de nombres de moléculas.
+.str.strip() elimina espacios en blanco al inicio y al final de cada valor. Ej: " amoxicilina " → "amoxicilina".
+.str.lower() convierte todo a minúsculas. Ej: "Amoxicilina" → "amoxicilina". Esto es importante para que la búsqueda en los PDFs no falle por diferencias de mayúsculas.
+
+
+python    df = df[df["DESC_MOLECULA_ASOC"].notna() & (df["DESC_MOLECULA_ASOC"].str.len() >= 4)]
+Filtra filas basura en dos condiciones:
+
+.notna() elimina filas donde la molécula esté vacía o sea NaN.
+.str.len() >= 4 elimina filas con texto demasiado corto (menos de 4 caracteres) que probablemente no son moléculas reales.
+
+
+python    moleculas = df.to_dict(orient="records")
+Convierte el DataFrame a una lista de diccionarios. Con orient="records" cada fila se convierte en un diccionario donde las claves son los nombres de las columnas. Ej:
+python[
+  {"COD_MOLECULA_ASSOC": "001", "DESC_MOLECULA_ASOC": "amoxicilina", ...},
+  {"COD_MOLECULA_ASSOC": "002", "DESC_MOLECULA_ASOC": "ibuprofeno", ...},
+]
+
+python    logging.info(f"Moléculas cargadas: {len(moleculas)}")
+    return moleculas
+
+logging.info imprime en consola cuántas moléculas se cargaron, útil para verificar que el CSV se leyó correctamente.
+return moleculas devuelve la lista final.
+
+
+
+fuincion con contador 
+
+def clasificar_carpeta(self, ruta_carpeta: Path, destino_base: Path) -> Detalle:
+    ruta_carpeta = Path(ruta_carpeta)
+    nombre = ruta_carpeta.name
+
+    destino_medicamentos = destino_base / "medicamentos"
+    destino_medicamentos.mkdir(parents=True, exist_ok=True)
+    destino_ambiguos = destino_base / "ambiguos"
+    destino_ambiguos.mkdir(parents=True, exist_ok=True)
+    destino_insumos = destino_base / "insumos"
+    destino_insumos.mkdir(parents=True, exist_ok=True)
+
+    # Contadores
+    conteo_moleculas = 0
+    conteo_insumos = 0
+
+    # Para el resumen final
+    molecula_encontrada = ""
+    pdf_origen = ""
+    pagina_origen = ""
+
+    pdfs = [p for p in ruta_carpeta.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+    pdfs_prioritarios = sorted(
+        [p for p in pdfs if self._prioridad_pdf(p.name) < len(self.prioridad_nombres)],
+        key=lambda p: (self._prioridad_pdf(p.name), p.name.lower())
+    )
+    pdfs_no_prioritarios = sorted(
+        [p for p in pdfs if self._prioridad_pdf(p.name) == len(self.prioridad_nombres)],
+        key=lambda p: p.name.lower()
+    )
+    pdfs = pdfs_prioritarios + pdfs_no_prioritarios
+
+    ya_aviso_no_prioritarios = False
+
+    for pdf_path in pdfs:
+        prioridad = self._prioridad_pdf(pdf_path.name)
+        es_prioritario = prioridad < len(self.prioridad_nombres)
+
+        if es_prioritario:
+            logging.info(f'🔍 Buscando en PDF prioritario: "{pdf_path.name}"')
+        elif not ya_aviso_no_prioritarios:
+            logging.info("🔎 Buscando en PDFs restantes...")
+            ya_aviso_no_prioritarios = True
+
+        try:
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                paginas_a_leer = min(self.paginas_a_leer, len(pdf.pages))
+
+                for num_pagina in range(paginas_a_leer):
+                    pagina = pdf.pages[num_pagina]
+
+                    for linea in extraer_lineas(pagina):
+                        linea_norm = normalizar(linea)
+                        linea_norm = re.sub(r'\s+', ' ', linea_norm)
+
+                        # 1. BUSCAR MOLÉCULAS PRIMERO (SIEMPRE)
+                        for molecula in self.moleculas:
+                            patron = r'\b' + re.escape(molecula['DESC_MOLECULA_ASOC']) + r'\b'
+                            if re.search(patron, linea_norm):
+                                conteo_moleculas += 1
+                                if not molecula_encontrada:  # guardar solo la primera
+                                    molecula_encontrada = molecula['DESC_MOLECULA_ASOC']
+                                    pdf_origen = pdf_path.name
+                                    pagina_origen = num_pagina + 1
+                                logging.info(
+                                    f"[+{conteo_moleculas}] Molécula: '{molecula['DESC_MOLECULA_ASOC']}' "
+                                    f"(PDF: {pdf_path.name}, Pág: {num_pagina + 1})"
+                                )
+
+                        # 2. BUSCAR INSUMOS DESPUÉS
+                        for kw in self.keywords_insumos:
+                            if kw in linea_norm:
+                                conteo_insumos += 1
+                                logging.info(
+                                    f"[+{conteo_insumos}] Insumo: '{kw}' "
+                                    f"(PDF: {pdf_path.name}, Pág: {num_pagina + 1})"
+                                )
+
+        except Exception as e_pdf:
+            logging.error(f"[ERROR] No se pudo abrir '{pdf_path.name}': {e_pdf}")
+
+    # DECISIÓN FINAL POR CONTEO
+    logging.info(f"📊 Conteo final → Moléculas: {conteo_moleculas} | Insumos: {conteo_insumos}")
+
+    if conteo_moleculas == 0 and conteo_insumos == 0:
+        clasificacion = "AMBIGUOS"
+    elif conteo_insumos > conteo_moleculas:
+        clasificacion = "INSUMOS"
+    else:
+        clasificacion = "MEDICAMENTOS"
+
+    # Determinar destino final
+    if clasificacion == "MEDICAMENTOS":
+        destino_final = destino_medicamentos
+    elif clasificacion == "INSUMOS":
+        destino_final = destino_insumos
+    else:
+        destino_final = destino_ambiguos
+
+    destino_carpeta = destino_final / nombre
+
+    if destino_carpeta.exists():
+        contador = 1
+        while True:
+            destino_carpeta_temp = destino_carpeta.parent / f"{nombre}_{contador}"
+            if not destino_carpeta_temp.exists():
+                destino_carpeta = destino_carpeta_temp
+                break
+            contador += 1
+
+    logging.info(f"📁 '{nombre}' clasificado como {clasificacion} → {destino_carpeta}")
+    shutil.move(str(ruta_carpeta), str(destino_carpeta))
+
+    return {
+        "carpeta": nombre,
+        "clasificacion": clasificacion,
+        "molecula_encontrada": molecula_encontrada,
+        "pdf_origen": pdf_origen,
+        "pagina_origen": pagina_origen,
+        "ruta_origen": str(ruta_carpeta),
+        "ruta_destino": str(destino_carpeta),
+    }
+
+Moléculas insumos  resultado 
+0           0       AMBIGUOS
+2           3       INSUMOS
+3           2       MEDICAMENTOS
+1           1       MEDICAMENTOS (empate va a medicamentos)
+
+----------------------------------------------
+
+def clasificar_carpeta(self, ruta_carpeta: Path, destino_base: Path) -> Detalle:
+    ruta_carpeta = Path(ruta_carpeta)
+    nombre = ruta_carpeta.name
+
+    destino_medicamentos = destino_base / "medicamentos"
+    destino_medicamentos.mkdir(parents=True, exist_ok=True)
+    destino_ambiguos = destino_base / "ambiguos"
+    destino_ambiguos.mkdir(parents=True, exist_ok=True)
+    destino_insumos = destino_base / "insumos"
+    destino_insumos.mkdir(parents=True, exist_ok=True)
+
+    # Contadores
+    conteo_moleculas = 0
+    conteo_insumos = 0
+
+    molecula_encontrada = ""
+    pdf_origen = ""
+    pagina_origen = ""
+
+    pdfs = [p for p in ruta_carpeta.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+    pdfs_prioritarios = sorted(
+        [p for p in pdfs if self._prioridad_pdf(p.name) < len(self.prioridad_nombres)],
+        key=lambda p: (self._prioridad_pdf(p.name), p.name.lower())
+    )
+    pdfs_no_prioritarios = sorted(
+        [p for p in pdfs if self._prioridad_pdf(p.name) == len(self.prioridad_nombres)],
+        key=lambda p: p.name.lower()
+    )
+    pdfs = pdfs_prioritarios + pdfs_no_prioritarios
+
+    ya_aviso_no_prioritarios = False
+
+    for pdf_path in pdfs:
+        prioridad = self._prioridad_pdf(pdf_path.name)
+        es_prioritario = prioridad < len(self.prioridad_nombres)
+
+        if es_prioritario:
+            logging.info(f'🔍 Buscando en PDF prioritario: "{pdf_path.name}"')
+        elif not ya_aviso_no_prioritarios:
+            logging.info("🔎 Buscando en PDFs restantes...")
+            ya_aviso_no_prioritarios = True
+
+        try:
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                paginas_a_leer = min(self.paginas_a_leer, len(pdf.pages))
+
+                for num_pagina in range(paginas_a_leer):
+                    pagina = pdf.pages[num_pagina]
+
+                    for linea in extraer_lineas(pagina):
+                        linea_norm = normalizar(linea)
+                        linea_norm = re.sub(r'\s+', ' ', linea_norm)
+
+                        # 1. BUSCAR MOLÉCULAS PRIMERO (SIEMPRE)
+                        for molecula in self.moleculas:
+                            patron = r'\b' + re.escape(molecula['DESC_MOLECULA_ASOC']) + r'\b'
+                            if re.search(patron, linea_norm):
+                                conteo_moleculas += 1
+                                if not molecula_encontrada:
+                                    molecula_encontrada = molecula['DESC_MOLECULA_ASOC']
+                                    pdf_origen = pdf_path.name
+                                    pagina_origen = num_pagina + 1
+                                logging.info(
+                                    f"[+{conteo_moleculas}] Molécula: '{molecula['DESC_MOLECULA_ASOC']}' "
+                                    f"(PDF: {pdf_path.name}, Pág: {num_pagina + 1})"
+                                )
+
+                        # 2. BUSCAR INSUMOS DESPUÉS
+                        for kw in self.keywords_insumos:
+                            if kw in linea_norm:
+                                conteo_insumos += 1
+                                logging.info(
+                                    f"[+{conteo_insumos}] Insumo: '{kw}' "
+                                    f"(PDF: {pdf_path.name}, Pág: {num_pagina + 1})"
+                                )
+
+        except Exception as e_pdf:
+            logging.error(f"[ERROR] No se pudo abrir '{pdf_path.name}': {e_pdf}")
+
+    # DECISIÓN FINAL — las moléculas tienen prioridad absoluta
+    logging.info(f"📊 Conteo final → Moléculas: {conteo_moleculas} | Insumos: {conteo_insumos}")
+
+    if conteo_moleculas >= 1:
+        clasificacion = "MEDICAMENTOS"
+    elif conteo_insumos >= 1:
+        clasificacion = "INSUMOS"
+    else:
+        clasificacion = "AMBIGUOS"
+
+    if clasificacion == "MEDICAMENTOS":
+        destino_final = destino_medicamentos
+    elif clasificacion == "INSUMOS":
+        destino_final = destino_insumos
+    else:
+        destino_final = destino_ambiguos
+
+    destino_carpeta = destino_final / nombre
+
+    if destino_carpeta.exists():
+        contador = 1
+        while True:
+            destino_carpeta_temp = destino_carpeta.parent / f"{nombre}_{contador}"
+            if not destino_carpeta_temp.exists():
+                destino_carpeta = destino_carpeta_temp
+                break
+            contador += 1
+
+    logging.info(f"📁 '{nombre}' clasificado como {clasificacion} → {destino_carpeta}")
+    shutil.move(str(ruta_carpeta), str(destino_carpeta))
+
+    return {
+        "carpeta": nombre,
+        "clasificacion": clasificacion,
+        "molecula_encontrada": molecula_encontrada,
+        "pdf_origen": pdf_origen,
+        "pagina_origen": pagina_origen,
+        "ruta_origen": str(ruta_carpeta),
+        "ruta_destino": str(destino_carpeta),
+    }
+
+if conteo_moleculas >= 1:       # con 1 sola molécula ya es MEDICAMENTOS
+    clasificacion = "MEDICAMENTOS"
+elif conteo_insumos >= 1:       # solo llega aquí si no hubo ninguna molécula
+    clasificacion = "INSUMOS"
+else:
+    clasificacion = "AMBIGUOS"
