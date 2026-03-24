@@ -1,382 +1,284 @@
-"""
-clasificador_carpetas.py — Clasificación + extracción secuencial inmediata
-
-Diseño:
-- Clasifica cada carpeta (una por una)
-- Si una carpeta es APTA (debe_extraerse=True), extrae sus PDFs inmediatamente
-- No espera a clasificar todas para extraer
-- No ejecuta extracción en paralelo (evita saturar CPU)
-- Código claro, limpio y fácil de modificar
-
-Mejoras:
-① Si se detecta frase gatillo pero NINGÚN token de categoría coincide
-  → se clasifica como MEDICAMENTOS por defecto y se extrae igual
-② Pase 2: si no hay gatillo, busca tokens directamente para evitar
-  SIN_DETECCION cuando "medicamentos" aparece sin frase de gatillo
-③ El detalle incluye el PDF exacto y la página donde se detectó la frase
-④ El resumen global no incluye la columna Debe_Extraerse
-"""
-
 from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
+from typing import Dict, List
 import pandas as pd
 import pdfplumber
 import unicodedata
-
+import shutil
+import re
 
 # =============================================================================
-# Logging limpio
+# Logging
 # =============================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(message)s",
+    format="%(message)s",   
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
-logging.getLogger("pdfplumber").setLevel(logging.ERROR)
-
 
 # =============================================================================
-# Categorías — cámbielas aquí si necesita renombrarlas
-# =============================================================================
-CATEGORIA_MEDICAMENTOS = "MEDICAMENTOS"
-CATEGORIA_DISPOSITIVOS = "DISPOSITIVOS"
-CATEGORIA_INSUMOS      = "INSUMOS"
-CATEGORIA_SIN          = "SIN_DETECCION"
-
-# Categoría por defecto cuando se detecta un gatillo pero ningún token coincide.
-CATEGORIA_FALLBACK = CATEGORIA_MEDICAMENTOS
-
-
-# =============================================================================
-# Tokens de categoría
-#
-# PRIORIDAD DE EVALUACIÓN: Medicamentos → Dispositivos → Insumos
-# Agregue o quite términos según la realidad de sus documentos.
-# Todos los tokens se comparan SIN acentos y en minúsculas.
-# =============================================================================
-
-TOKENS_MEDICAMENTOS: Tuple[str, ...] = (
-    "medicamento", "medicamentos",
-    "farmaco", "farmacos",
-    "farmaceutico", "farmaceuticos",
-    "farmacia", "farmacias",
-    "ampolla", "ampollas",
-    "tableta", "tabletas",
-    "capsula", "capsulas",
-    "jarabe", "jarabes",
-    "solucion inyectable", "soluciones inyectables",
-    "vacuna", "vacunas",
-    "medicacion", "medicaciones",
-    "principio activo", "principios activos",
-    "especialidad farmaceutica",
-)
-
-TOKENS_DISPOSITIVOS: Tuple[str, ...] = (
-    "dispositivo", "dispositivos",
-    "dispositivo medico", "dispositivos medicos",
-    "equipo medico", "equipos medicos",
-    "equipo biomedico", "equipos biomedicos",
-    "instrumento medico", "instrumentos medicos",
-    "aparato medico", "aparatos medicos",
-    "tecnologia medica", "tecnologias medicas",
-    "material biomedico",
-)
-
-TOKENS_INSUMOS: Tuple[str, ...] = (
-    "insumo", "insumos",
-    "insumo medico", "insumos medicos",
-    "material medico", "materiales medicos",
-    "descartable", "descartables",
-    "consumible", "consumibles",
-    "suministro medico", "suministros medicos",
-    "material quirurgico", "materiales quirurgicos",
-    "material hospitalario",
-)
-
-# Frases que "activan" el análisis de categoría en esa línea.
-GATILLOS: Tuple[str, ...] = (
-    "adquisicion de",
-    "contratacion de",
-    "compra de",
-    "suministro de",
-    "provision de",
-    "abastecimiento de",
-)
-
-
-# =============================================================================
-# Columnas del Excel Detalle (en este orden exacto)
+# Columnas Excel Resumen
 # =============================================================================
 COLUMNAS_DETALLE = (
     "carpeta",
     "clasificacion",
-    "frase_detectada",
-    "motivo",
+    "molecula_encontrada",
     "pdf_origen",
     "pagina_origen",
-    "ruta",
-    "debe_extraerse",
+    "ruta_origen",
+    "ruta_destino",
 )
 
-# Alias de tipo para mayor claridad
 Detalle = Dict[str, object]
-
 
 # =============================================================================
 # Utilidades
 # =============================================================================
-
 def normalizar(texto: str) -> str:
-    """Quita acentos y convierte a minúsculas para comparaciones robustas."""
     if not isinstance(texto, str):
         return ""
-    sin_acentos = "".join(
+    texto = "".join(
         c for c in unicodedata.normalize("NFKD", texto)
         if not unicodedata.combining(c)
     )
-    return sin_acentos.lower()
-
+    return texto.lower()
 
 def extraer_lineas(pagina) -> List[str]:
-    """
-    Extrae líneas de texto de una página pdfplumber.
-    Si extract_text() no devuelve nada, intenta extract_words() como fallback.
-    """
-    txt    = pagina.extract_text() or ""
-    lineas = [l for l in txt.splitlines() if l.strip()]
-    if lineas:
-        return lineas
-
-    # Fallback: reconstruir línea a partir de palabras sueltas
     try:
+        txt = pagina.extract_text() or ""
+        lineas = [l for l in txt.splitlines() if l.strip()]
+        if lineas:
+            return lineas
         palabras = pagina.extract_words() or []
-        linea    = " ".join(w.get("text", "") for w in palabras if w.get("text"))
+        linea = " ".join(w.get("text", "") for w in palabras)
         if linea.strip():
             return [linea]
-    except Exception:
-        pass
-
+    except Exception as e:
+        logging.warning(f"[WARN] No se pudo extraer texto de la página: {e}")
     return []
 
 
 # =============================================================================
-# Clasificador
+# Clasificador por moléculas
 # =============================================================================
-
 class ClasificadorCarpetas:
-    """
-    Clasifica carpetas analizando frases en sus PDFs.
 
-    Lógica de clasificación:
-    Pase 1 — busca líneas con gatillo + token de categoría.
-    Pase 2 — si el pase 1 no encontró nada, busca tokens directamente
-             sin requerir gatillo. Evita SIN_DETECCION cuando aparece
-             "medicamentos" o similar sin frase de gatillo delante.
-
-    Solo llega a SIN_DETECCION si no hay ni gatillo ni token en ningún PDF.
-    """
-
-    def __init__(
-        self,
-        paginas_a_leer: int = 3,
-        tokens_meds: Tuple[str, ...] = TOKENS_MEDICAMENTOS,
-        tokens_disp: Tuple[str, ...] = TOKENS_DISPOSITIVOS,
-        tokens_insu: Tuple[str, ...] = TOKENS_INSUMOS,
-        gatillos: Tuple[str, ...] = GATILLOS,
-        categoria_fallback: str = CATEGORIA_FALLBACK,
-    ):
-        self.paginas_a_leer     = max(1, int(paginas_a_leer))
-        self.tokens_meds        = tokens_meds
-        self.tokens_disp        = tokens_disp
-        self.tokens_insu        = tokens_insu
-        self.gatillos           = gatillos
-        self.categoria_fallback = categoria_fallback
-
-    # ------------------------------------------------------------------
-    # Métodos internos
-    # ------------------------------------------------------------------
-
-    def _linea_tiene_gatillo(self, linea_normalizada: str) -> bool:
-        """Devuelve True si la línea contiene alguna frase gatillo."""
-        return any(g in linea_normalizada for g in self.gatillos)
-
-    def _categoria_de_linea(self, linea_normalizada: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Determina la categoría según los tokens presentes en la línea.
-        Devuelve (categoria, token_encontrado) o (None, None) si no hay match.
-        El orden de evaluación define la prioridad entre categorías:
-        MEDICAMENTOS → DISPOSITIVOS → INSUMOS
-        """
-        grupos = [
-            (self.tokens_meds, CATEGORIA_MEDICAMENTOS),
-            (self.tokens_disp, CATEGORIA_DISPOSITIVOS),
-            (self.tokens_insu, CATEGORIA_INSUMOS),
+    def __init__(self, paginas_a_leer: int = 3):
+        self.paginas_a_leer = max(1, int(paginas_a_leer))
+        self.prioridad_nombres = [
+            "contrato",
+            "resolucion de adjudicacion",
+            "factura",
+            "tabla de valores y precios",
+            "ofertas",
+            "especificacion tecnica",
+            "informe de necesidad",
+            "proforma",
+            "registro sanitario",
+            "reg san",
         ]
-        for tokens, categoria in grupos:
-            for tok in tokens:
-                if tok in linea_normalizada:
-                    return categoria, tok
+        self.keywords_insumos = [
+            "insumo",
+            "insumos",
+            "kit",
+            "kits",
+            "reactivo",
+            "reactivos",
+            "material",
+            "materiales",
+            "dispositivo",
+            "dispositivos",
+        ]
 
-        return None, None
 
-    def _leer_lineas_pdf(self, pdf_path: Path) -> List[Tuple[int, str]]:
-        """
-        Lee las primeras `paginas_a_leer` páginas de un PDF.
-        Devuelve lista de (num_pagina_base1, linea).
-        """
-        lineas: List[Tuple[int, str]] = []
-        try:
-            with pdfplumber.open(str(pdf_path)) as pdf:
-                paginas_a_revisar = min(self.paginas_a_leer, len(pdf.pages))
-                for num_pagina in range(paginas_a_revisar):
-                    for linea in extraer_lineas(pdf.pages[num_pagina]):
-                        lineas.append((num_pagina + 1, linea))
-        except Exception as e:
-            logging.error(f"[ERROR] No se pudo leer '{pdf_path.name}': {e}")
-        return lineas
+        # Ruta fija del Excel con moléculas
+        ruta_excel = Path(
+            r"C:\Users\pasante.oper\OneDrive - Close-up International\Escritorio\maestro moleculas"
+        )
+        self.moleculas = self._leer_excel_moleculas(ruta_excel)
+        
 
-    # ------------------------------------------------------------------
-    # Método público principal
-    # ------------------------------------------------------------------
+    def _leer_excel_moleculas(self, ruta_archivo: Path) -> List[Dict[str, str]]:
+        df = pd.read_csv(ruta_archivo, sep="|", dtype=str)
+        
+        df.columns = ["COD_MOLECULA_ASSOC", "DESC_MOLECULA_ASOC", "COD_MOLECULA_ASSOC_2",
+                    "DESC_MOLECULA_ASSOC_ENG", "DESC_MOLECULA_ASSOC_POR"]
+        
+        df["DESC_MOLECULA_ASOC"] = df["DESC_MOLECULA_ASOC"].str.strip().str.lower()
+        df = df[df["DESC_MOLECULA_ASOC"].notna() & (df["DESC_MOLECULA_ASOC"].str.len() >= 4)]
 
-    def clasificar_carpeta_por_frase(self, ruta_carpeta: Path) -> Detalle:
-        """
-        Clasifica una carpeta revisando sus PDFs línea por línea.
+        moleculas = df.to_dict(orient="records")
+        logging.info(f"Moléculas cargadas: {len(moleculas)}")
+        return moleculas
+    
+    def _prioridad_pdf(self, nombre_pdf: str) -> int:
+        nombre_norm = normalizar(nombre_pdf)
 
-        Devuelve un diccionario con:
-        - carpeta, ruta, clasificacion, frase_detectada, motivo
-        - pdf_origen: nombre del PDF donde se encontró la frase
-        - pagina_origen: número de página (base 1)
-        - debe_extraerse: True si la carpeta debe procesarse
-        """
+        for i, palabra in enumerate(self.prioridad_nombres):
+            if palabra in nombre_norm:
+                return i  # mientras más pequeño, más prioridad
+
+        return len(self.prioridad_nombres)  # sin prioridad
+
+
+
+    def clasificar_carpeta_por_frase(self, carpeta: Path, destino_base: Path = Path.cwd () ) -> Detalle:
+        return self.clasificar_carpeta(carpeta, destino_base)
+    
+    def clasificar_carpeta(self, ruta_carpeta: Path, destino_base: Path) -> Detalle:
         ruta_carpeta = Path(ruta_carpeta)
-        nombre       = ruta_carpeta.name
+        nombre = ruta_carpeta.name
 
-        pdfs = sorted(
-            (p for p in ruta_carpeta.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"),
-            key=lambda p: p.name,
+        # Crear carpetas globales de destino si no existen
+        destino_medicamentos = destino_base / "medicamentos"
+        destino_medicamentos.mkdir(parents=True, exist_ok=True)
+
+        destino_ambiguos = destino_base / "ambiguos"
+        destino_ambiguos.mkdir(parents=True, exist_ok=True)
+
+        destino_insumos = destino_base / "insumos"
+        destino_insumos.mkdir(parents=True, exist_ok=True)
+
+        # Variables para registrar resultados
+        clasificacion = "AMBIGUOS"
+        molecula_encontrada = ""
+        pdf_origen = ""
+        pagina_origen = ""
+
+        # Obtener PDFs
+        pdfs = [p for p in ruta_carpeta.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+
+        # Separar PDFs prioritarios
+        pdfs_prioritarios = sorted(
+            [p for p in pdfs if self._prioridad_pdf(p.name) < len(self.prioridad_nombres)],
+            key=lambda p: (self._prioridad_pdf(p.name), p.name.lower())
         )
 
-        # ------------------------------------------------------------------
-        # Pase 1: gatillo + token (resultado más preciso)
-        # ------------------------------------------------------------------
+        # Separar PDFs no prioritarios
+        pdfs_no_prioritarios = sorted(
+            [p for p in pdfs if self._prioridad_pdf(p.name) == len(self.prioridad_nombres)],
+            key=lambda p: p.name.lower()
+        )
+
+        # Unir: primero prioritarios
+        pdfs = pdfs_prioritarios + pdfs_no_prioritarios
+
+        ya_aviso_no_prioritarios = False
+
         for pdf_path in pdfs:
-            for num_pagina, linea in self._leer_lineas_pdf(pdf_path):
-                linea_norm = normalizar(linea)
+            prioridad = self._prioridad_pdf(pdf_path.name)
+            es_prioritario = prioridad < len(self.prioridad_nombres)
 
-                if not self._linea_tiene_gatillo(linea_norm):
-                    continue
+            # Logs controlados
+            if es_prioritario:
+                logging.info(f'🔍 Buscando en PDF prioritario: "{pdf_path.name}"')
+            elif not ya_aviso_no_prioritarios:
+                logging.info("🔎 Buscando en PDFs restantes...")
+                ya_aviso_no_prioritarios = True
 
-                # Gatillo encontrado → buscar categoría
-                categoria, token = self._categoria_de_linea(linea_norm)
+            try:
+                with pdfplumber.open(str(pdf_path)) as pdf:
+                    paginas_a_leer = min(self.paginas_a_leer, len(pdf.pages))
 
-                if categoria is None:
-                    # Gatillo sin token → usar fallback para no perder la carpeta
-                    categoria = self.categoria_fallback
-                    token     = "[fallback desde gatillo sin token]"
+                    for num_pagina in range(paginas_a_leer):
+                        pagina = pdf.pages[num_pagina]
 
-                return {
-                    "carpeta":         nombre,
-                    "ruta":            str(ruta_carpeta),
-                    "clasificacion":   categoria,
-                    "frase_detectada": linea.strip(),
-                    "motivo":          token or "",
-                    "pdf_origen":      pdf_path.name,
-                    "pagina_origen":   num_pagina,
-                    "debe_extraerse":  True,
-                }
+                        for linea in extraer_lineas(pagina):
+                            linea_norm = normalizar(linea)
+                            linea_norm = re.sub(r'\s+', ' ', linea_norm)
 
-        # ------------------------------------------------------------------
-        # Pase 2: sin gatillo, buscar tokens directamente.
-        # Evita SIN_DETECCION cuando "medicamentos" aparece sin la frase
-        # exacta de un gatillo ("adquisición de", "compra de", etc.).
-        # ------------------------------------------------------------------
-        for pdf_path in pdfs:
-            for num_pagina, linea in self._leer_lineas_pdf(pdf_path):
-                linea_norm = normalizar(linea)
-                categoria, token = self._categoria_de_linea(linea_norm)
+                            #  1. BUSCAR INSUMOS (PRIORIDAD MÁS ALTA)
+                            for kw in self.keywords_insumos:
+                                if kw in linea_norm:
+                                    clasificacion = "INSUMOS"
+                                    molecula_encontrada = kw
+                                    pdf_origen = pdf_path.name
+                                    pagina_origen = num_pagina + 1
 
-                if categoria is None:
-                    continue  # línea sin tokens de interés
+                                    if es_prioritario:
+                                        logging.info(
+                                            f"Insumo detectado: {kw} "
+                                            f"(PDF: {pdf_origen}, Página: {pagina_origen})"
+                                        )
+                                    break
 
-                return {
-                    "carpeta":         nombre,
-                    "ruta":            str(ruta_carpeta),
-                    "clasificacion":   categoria,
-                    "frase_detectada": linea.strip(),
-                    "motivo":          f"[token directo] {token}",
-                    "pdf_origen":      pdf_path.name,
-                    "pagina_origen":   num_pagina,
-                    "debe_extraerse":  True,
-                }
+                            if clasificacion == "INSUMOS":
+                                break
 
-        # Ningún gatillo ni token encontrado en ningún PDF
+                            # 2. BUSCAR MOLÉCULAS
+                            for molecula in self.moleculas:
+                                patron = r'\b' + re.escape(molecula['DESC_MOLECULA_ASOC']) + r'\b'
+                                if re.search(patron, linea_norm):
+
+                                    clasificacion = "MEDICAMENTOS"
+                                    molecula_encontrada = molecula
+                                    pdf_origen = pdf_path.name
+                                    pagina_origen = num_pagina + 1
+
+                                    if es_prioritario:
+                                        logging.info(
+                                            f" Molécula encontrada: {molecula['DESC_MOLECULA_ASOC']} "
+                                            f"(PDF: {pdf_origen}, Página: {pagina_origen})"
+                                        )
+                                    break
+
+                            if clasificacion == "MEDICAMENTOS":
+                                break
+
+                        if clasificacion in ["MEDICAMENTOS", "INSUMOS"]:
+                            break
+
+                    if clasificacion in ["MEDICAMENTOS", "INSUMOS"]:
+                        break
+
+            except Exception as e_pdf:
+                logging.error(f"[ERROR] No se pudo abrir '{pdf_path.name}': {e_pdf}")
+
+        # Determinar destino final
+        if clasificacion == "MEDICAMENTOS":
+            destino_final = destino_medicamentos
+        elif clasificacion == "INSUMOS":
+            destino_final = destino_insumos
+        else:
+            destino_final = destino_ambiguos
+
+        destino_carpeta = destino_final / nombre
+
+        # Evitar sobreescritura
+        if destino_carpeta.exists():
+            contador = 1
+            while True:
+                destino_carpeta_temp = destino_carpeta.parent / f"{nombre}_{contador}"
+                if not destino_carpeta_temp.exists():
+                    destino_carpeta = destino_carpeta_temp
+                    break
+                contador += 1
+
+        # Mover carpeta
+        logging.info(f"Moviendo carpeta '{nombre}' → {destino_carpeta}")
+        shutil.move(str(ruta_carpeta), str(destino_carpeta))
+
         return {
-            "carpeta":         nombre,
-            "ruta":            str(ruta_carpeta),
-            "clasificacion":   CATEGORIA_SIN,
-            "frase_detectada": "",
-            "motivo":          "",
-            "pdf_origen":      "",
-            "pagina_origen":   "",
-            "debe_extraerse":  False,
+            "carpeta": nombre,
+            "clasificacion": clasificacion,
+            "molecula_encontrada": molecula_encontrada,
+            "pdf_origen": pdf_origen,
+            "pagina_origen": pagina_origen,
+            "ruta_origen": str(ruta_carpeta),
+            "ruta_destino": str(destino_carpeta),
         }
-
-
 # =============================================================================
-# Generación del Excel de resumen
+# Generar Excel Resumen
 # =============================================================================
-
-def _dataframe_resumen(detalles: Iterable[Detalle]) -> pd.DataFrame:
-    """
-    Hoja Resumen: vista resumida para revisión rápida.
-    Columnas: Carpeta, Clasificación, Frase_Detectada, PDF_Origen, Página_Origen.
-    La columna Debe_Extraerse se omite intencionalmente del resumen.
-    """
-    filas = [
-        {
-            "Carpeta":         d.get("carpeta", ""),
-            "Clasificación":   d.get("clasificacion", ""),
-            "Frase_Detectada": d.get("frase_detectada", ""),
-            "PDF_Origen":      d.get("pdf_origen", ""),
-            "Página_Origen":   d.get("pagina_origen", ""),
-        }
-        for d in detalles
-    ]
-    df = pd.DataFrame(filas)
-    return df.sort_values(by=["Clasificación", "Carpeta"])
-
-
-def _dataframe_detalle(detalles: Iterable[Detalle]) -> pd.DataFrame:
-    """Hoja Detalle: todas las columnas para análisis completo."""
-    df = pd.DataFrame(list(detalles))
-
-    # Garantizar que todas las columnas existan aunque estén vacías
+def generar_resumen_excel(detalles: List[Detalle], ruta_excel: Path):
+    ruta_excel.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(detalles)
     for col in COLUMNAS_DETALLE:
         if col not in df.columns:
             df[col] = ""
-
-    return df[list(COLUMNAS_DETALLE)].sort_values(by=["clasificacion", "carpeta"])
-
-
-def generar_resumen_excel_desde_detalles(detalles: List[Detalle], ruta_excel: Path | str) -> None:
-    """
-    Exporta el Excel global con dos hojas:
-    - Resumen: Carpeta, Clasificación, Frase_Detectada, PDF_Origen, Página_Origen
-    - Detalle: todas las columnas incluyendo ruta y debe_extraerse
-    """
-    ruta_excel = Path(ruta_excel)
-    ruta_excel.parent.mkdir(parents=True, exist_ok=True)
-
-    with pd.ExcelWriter(ruta_excel, engine="openpyxl") as writer:
-        _dataframe_resumen(detalles).to_excel(writer, sheet_name="Resumen", index=False)
-        _dataframe_detalle(detalles).to_excel(writer, sheet_name="Detalle", index=False)
-
+    df = df[list(COLUMNAS_DETALLE)].sort_values(by=["clasificacion", "carpeta"])
+    df.to_excel(ruta_excel, index=False)
     logging.info(f"✔ Resumen global generado: {ruta_excel}")
